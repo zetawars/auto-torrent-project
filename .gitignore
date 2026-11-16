@@ -1,0 +1,20 @@
+# Whitelist: only the stack definition, scripts and docs are tracked.
+# Never tracked: .env (secrets), config/ (API keys + databases), cache/
+*
+!.gitignore
+!README.md
+!docker-compose.yml
+!.env.example
+!*.sh
+!tdarr/
+!tdarr/build-flow.js
+!systemd/
+!systemd/*.service
+!stallwatch/
+!stallwatch/server.py
+!songdrop/
+!songdrop/Dockerfile
+!songdrop/index.html
+!songdrop/server.py
+!dlrouter/
+!dlrouter/decypharr_fallback.py

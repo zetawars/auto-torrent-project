@@ -1,0 +1,15 @@
+[Unit]
+Description=TurboVNC virtual XFCE desktop on display :1 (port 5901)
+After=network-online.target
+
+[Service]
+Environment=DBUS_SESSION_BUS_ADDRESS=unix:path=%t/bus
+Type=simple
+ExecStartPre=-/usr/bin/vncserver -kill :1
+ExecStart=/usr/bin/vncserver :1 -fg -userdbus -geometry 1920x1080 -depth 24 -wm xfce
+ExecStop=/usr/bin/vncserver -kill :1
+Restart=on-failure
+RestartSec=10
+
+[Install]
+WantedBy=default.target

@@ -1,0 +1,380 @@
+# Media stack — run from ~/mediastack:  docker compose up -d
+# Secrets/settings come from .env in this folder.
+#
+# VPN namespace (gluetun): qbittorrent, prowlarr, flaresolverr
+#   - all their traffic goes out via ProtonVPN; if the VPN drops they have no internet
+#   - other containers reach them at gluetun:<port>
+# Static IPs on the "media" network so Prowlarr (inside gluetun, which uses its
+# own DNS) can reach the arrs by IP.
+
+x-common-env: &common-env
+  PUID: ${PUID}
+  PGID: ${PGID}
+  UMASK: ${UMASK}
+  TZ: ${TZ}
+
+networks:
+  media:
+    ipam:
+      config:
+        - subnet: 172.30.0.0/24
+          ip_range: 172.30.0.128/25   # dynamic IPs only from .128+, so they never steal a static one
+
+services:
+  # ---------------------------------------------------------------- VPN
+  gluetun:
+    image: qmcgaw/gluetun:latest
+    container_name: gluetun
+    cap_add: [NET_ADMIN]
+    devices: [/dev/net/tun:/dev/net/tun]
+    networks:
+      media:
+        ipv4_address: 172.30.0.2
+    ports:
+      - 8080:8080   # qBittorrent WebUI
+      - 9696:9696   # Prowlarr
+      - 5030:5030   # slskd
+    environment:
+      TZ: ${TZ}
+      VPN_SERVICE_PROVIDER: protonvpn
+      VPN_TYPE: wireguard
+      WIREGUARD_PRIVATE_KEY: ${WIREGUARD_PRIVATE_KEY}
+      PORT_FORWARD_ONLY: "on"          # only P2P servers that support port forwarding
+      VPN_PORT_FORWARDING: "on"
+      # push the forwarded port into qBittorrent whenever it changes
+      VPN_PORT_FORWARDING_UP_COMMAND: >-
+        /bin/sh -c 'wget -O- --retry-connrefused --tries=30 --post-data
+        "json={\"listen_port\":{{PORTS}}}"
+        http://127.0.0.1:8080/api/v2/app/setPreferences 2>&1'
+      FIREWALL_OUTBOUND_SUBNETS: ${LAN_SUBNET}
+    volumes:
+      - ./config/gluetun:/gluetun
+    restart: unless-stopped
+
+  qbittorrent:
+    image: lscr.io/linuxserver/qbittorrent:latest
+    container_name: qbittorrent
+    network_mode: service:gluetun
+    depends_on:
+      gluetun: {condition: service_healthy}
+    environment:
+      <<: *common-env
+      WEBUI_PORT: 8080
+    volumes:
+      - ./config/qbittorrent:/config
+      - ${DATA_DIR}:/data
+    restart: unless-stopped
+
+  prowlarr:
+    image: lscr.io/linuxserver/prowlarr:latest
+    container_name: prowlarr
+    network_mode: service:gluetun
+    depends_on:
+      gluetun: {condition: service_healthy}
+    environment: *common-env
+    volumes:
+      - ./config/prowlarr:/config
+    restart: unless-stopped
+
+  flaresolverr:   # runs Byparr, a drop-in replacement: FlareSolverr itself could not pass the Cloudflare check on 1337x
+    image: ghcr.io/thephaseless/byparr:latest
+    container_name: flaresolverr
+    network_mode: service:gluetun     # Prowlarr uses http://localhost:8191
+    depends_on:
+      gluetun: {condition: service_healthy}
+    environment:
+      TZ: ${TZ}
+    restart: unless-stopped
+
+  # ---------------------------------------------------------------- *arrs
+  radarr:
+    image: lscr.io/linuxserver/radarr:latest
+    container_name: radarr
+    networks:
+      media: {ipv4_address: 172.30.0.10}
+    ports: [7878:7878]
+    environment: *common-env
+    volumes:
+      - ./config/radarr:/config
+      - ${DATA_DIR}:/data
+      - /mnt/media2:/mnt/media2:rslave
+      - /mnt/usb-library:/mnt/usb-library:rslave   # 6 TB drive: finished movies are imported here
+    restart: unless-stopped
+
+  sonarr:
+    image: lscr.io/linuxserver/sonarr:latest
+    container_name: sonarr
+    networks:
+      media: {ipv4_address: 172.30.0.11}
+    ports: [8989:8989]
+    environment: *common-env
+    volumes:
+      - ./config/sonarr:/config
+      - ${DATA_DIR}:/data
+      - /mnt/media2:/mnt/media2:rslave
+      - /mnt/usb-library:/mnt/usb-library:rslave   # 6 TB drive: finished shows are imported here
+    restart: unless-stopped
+
+  lidarr:
+    image: lscr.io/linuxserver/lidarr:latest
+    container_name: lidarr
+    networks:
+      media: {ipv4_address: 172.30.0.18}
+    ports: [8686:8686]
+    environment: *common-env
+    volumes:
+      - ./config/lidarr:/config
+      - ${DATA_DIR}:/data
+    restart: unless-stopped
+
+  lidify:   # music discovery: suggests artists similar to your Lidarr library (Last.fm), adds picks to Lidarr
+    image: thewicklowwolf/lidify:latest
+    container_name: lidify
+    networks:
+      media: {ipv4_address: 172.30.0.19}
+    ports: [5000:5000]
+    environment:
+      PUID: ${PUID}
+      PGID: ${PGID}
+      mode: LastFM
+      last_fm_api_key: ${LASTFM_API_KEY}
+      last_fm_api_secret: ${LASTFM_API_SECRET}
+      lidarr_address: http://lidarr:8686
+      lidarr_api_key: ${LIDARR_API_KEY}
+      root_folder_path: /data/media/music/
+      quality_profile_id: 3        # Lidarr "Standard" (MP3/AAC up to 320)
+      metadata_profile_id: 1       # Lidarr "Standard"
+      search_for_missing_albums: "false"  # add only; pick albums/singles to download in Lidarr
+      fallback_to_top_result: "false"
+    volumes:
+      - ./config/lidify:/lidify/config
+      - /etc/localtime:/etc/localtime:ro
+    depends_on: [lidarr]
+    restart: unless-stopped
+
+  # ---------------------------------------------------------------- single songs
+  slskd:   # Soulseek client; inside the VPN like qBittorrent. Shares the music library read-only.
+    image: slskd/slskd:0.25.1
+    container_name: slskd
+    network_mode: service:gluetun     # web UI at 10.0.0.42:5030; DroppedNeedle uses http://gluetun:5030
+    depends_on:
+      gluetun: {condition: service_healthy}
+    user: ${PUID}:${PGID}
+    environment:
+      TZ: ${TZ}
+      SLSKD_UMASK: ${UMASK}
+      SLSKD_SLSK_USERNAME: ${SLSK_USERNAME}
+      SLSKD_SLSK_PASSWORD: ${SLSK_PASSWORD}
+      SLSKD_USERNAME: ${SLSKD_WEB_USERNAME}
+      SLSKD_PASSWORD: ${SLSKD_WEB_PASSWORD}
+      SLSKD_API_KEY: ${SLSKD_API_KEY}
+      SLSKD_DOWNLOADS_DIR: /data/slskd/complete
+      SLSKD_INCOMPLETE_DIR: /data/slskd/incomplete
+      SLSKD_SHARED_DIR: /music
+      SLSKD_REMOTE_CONFIGURATION: "true"
+    volumes:
+      - ./config/slskd:/app
+      - ${DATA_DIR}/slskd:/data/slskd
+      - ${DATA_DIR}/media/music:/music:ro
+    restart: unless-stopped
+
+  droppedneedle:   # request single tracks or albums -> slskd -> /data/media/music
+    image: droppedneedle/droppedneedle:latest
+    container_name: droppedneedle
+    networks:
+      media: {ipv4_address: 172.30.0.20}
+    ports: [8688:8688]
+    environment:
+      PUID: ${PUID}
+      PGID: ${PGID}
+      UMASK: ${UMASK}
+      TZ: ${TZ}
+      SLSKD_DOWNLOADS_PATH: /data/slskd/complete
+    volumes:
+      - ./config/droppedneedle/config:/app/config
+      - ./config/droppedneedle/cache:/app/cache
+      - ./config/droppedneedle/plugins:/app/plugins
+      - ${DATA_DIR}:/data        # one mount: slskd downloads + music library on the same filesystem
+    restart: unless-stopped
+
+  metube:   # yt-dlp web UI: YouTube / YouTube Music audio -> /data/media/music/YouTube
+    image: ghcr.io/alexta69/metube:latest
+    container_name: metube
+    networks:
+      media: {ipv4_address: 172.30.0.21}
+    ports: [8081:8081]
+    environment:
+      PUID: ${PUID}
+      PGID: ${PGID}
+      UMASK: ${UMASK}
+      TZ: ${TZ}
+      DOWNLOAD_DIR: /music
+      AUDIO_DOWNLOAD_DIR: /music
+      STATE_DIR: /state
+      TEMP_DIR: /music/.tmp
+      # one folder per artist and per song: Jellyfin builds albums from folders, so loose files in one folder merge into a single album
+      OUTPUT_TEMPLATE: "%(artist,creator,uploader)s/%(track,title)s/%(artist,creator,uploader)s - %(track,title)s.%(ext)s"
+      OUTPUT_TEMPLATE_PLAYLIST: "%(playlist_title)s/%(artist,creator,uploader)s - %(track,title)s.%(ext)s"
+      CORS_ALLOWED_ORIGINS: "*"   # lets the MeTube browser extension (Chrome/Firefox) send links; LAN only
+      # singles from YouTube have no album tag, and Jellyfin/Finamp list music by album: use the title as the album
+      YTDL_OPTIONS: '{"postprocessors":[{"key":"MetadataFromField","formats":["%(album,title)s:%(meta_album)s"],"when":"pre_process"}]}'
+    volumes:
+      - ${DATA_DIR}/media/music/YouTube:/music
+      - ./config/metube/state:/state
+    restart: unless-stopped
+
+  songdrop:   # phone page: paste a link -> MeTube (M4A audio) -> shows when the song is in Jellyfin
+    build: ./songdrop          # python:alpine + mutagen (tag writer)
+    image: songdrop:local
+    container_name: songdrop
+    user: "${PUID}:${PGID}"
+    networks:
+      media: {ipv4_address: 172.30.0.22}
+    ports: [8090:8090]
+    environment:
+      TZ: ${TZ}
+      METUBE_URL: http://metube:8081
+      JELLYFIN_URL: http://jellyfin:8096
+      JELLYFIN_API_KEY: ${JELLYFIN_API_KEY}
+      JELLYFIN_PUBLIC_URL: http://10.0.0.42:8096     # links the phone opens
+      METUBE_PUBLIC_URL: http://10.0.0.42:8081
+      JELLYFIN_MUSIC_PATH: /data/media/music/YouTube   # MeTube download folder as Jellyfin sees it
+    volumes:
+      - ./songdrop:/app:ro
+      - ./config/songdrop:/data
+      - ${DATA_DIR}/media/music/YouTube:/music   # MeTube download folder, writable so the chosen artist can be written into the file
+    command: ["python", "-u", "/app/server.py"]
+    depends_on: [metube, jellyfin]
+    restart: unless-stopped
+
+  # ---------------------------------------------------------------- Real-Debrid
+  decypharr:
+    image: cy01/blackhole:latest
+    container_name: decypharr
+    networks:
+      media: {ipv4_address: 172.30.0.13}
+    ports: [8282:8282]
+    environment: *common-env
+    volumes:
+      - ./config/decypharr:/app
+      - ${DATA_DIR}:/data
+    restart: unless-stopped
+
+  # Decypharr first, qBittorrent (VPN) when Real-Debrid refuses a torrent.
+  # The arrs' "Decypharr" download client points here instead of at decypharr.
+  dlrouter:
+    image: ghcr.io/zetawars/decypharr-fallback:1   # github.com/zetawars/decypharr-fallback
+    container_name: dlrouter
+    networks:
+      media: {ipv4_address: 172.30.0.17}
+    environment:
+      TZ: ${TZ}
+      DECYPHARR_URL: http://decypharr:8282
+      QBIT_URL: http://gluetun:8080
+      QBIT_USERNAME: ${QBIT_USERNAME}
+      QBIT_PASSWORD: ${QBIT_PASSWORD}
+    volumes:
+      # local patch until the image has it: tells the arrs qBittorrent's seeding limit so finished torrents get removed
+      - ./dlrouter/decypharr_fallback.py:/app/decypharr_fallback.py:ro
+    depends_on: [decypharr, gluetun]
+    restart: unless-stopped
+
+  stallwatch:   # pauses downloads that make no progress so the queue keeps moving; retries oldest first; review page on :8091
+    image: python:3.13-alpine
+    container_name: stallwatch
+    user: "${PUID}:${PGID}"
+    networks:
+      media: {ipv4_address: 172.30.0.23}
+    ports: [8091:8091]
+    environment:
+      TZ: ${TZ}
+      QBIT_URL: http://gluetun:8080
+      QBIT_USERNAME: ${QBIT_USERNAME}
+      QBIT_PASSWORD: ${QBIT_PASSWORD}
+      CHECK_MINUTES: 60     # how often qBittorrent is looked at
+      STALL_MINUTES: 30    # no progress for this long = stalled
+      RETRY_HOURS: 6        # wait before a stalled download is tried again
+      MAX_STALLS: 5         # after this many stalls it stays stopped, tagged needs-review
+      RADARR_URL: http://radarr:7878
+      RADARR_API_KEY: ${RADARR_API_KEY}
+      REPLACE_STALLS: 3     # after this many stalls Radarr is asked for another release with seeders (Hindi only for Hindi)
+      MIN_FREE_GB: 50       # downloads pause below this much free space, resume at +20
+    volumes:
+      - ./stallwatch:/app:ro
+      - ./config/stallwatch:/data
+    command: ["python", "-u", "/app/server.py"]
+    depends_on: [gluetun]
+    restart: unless-stopped
+
+  # ---------------------------------------------------------------- conversion
+  tdarr:
+    image: ghcr.io/haveagitgat/tdarr:latest
+    container_name: tdarr
+    networks:
+      media: {ipv4_address: 172.30.0.14}
+    ports: [8265:8265]
+    environment:
+      <<: *common-env
+      UMASK_SET: ${UMASK}
+      serverIP: 0.0.0.0
+      serverPort: 8266
+      webUIPort: 8265
+      internalNode: "true"
+      inContainer: "true"
+      nodeName: MainNode
+      ffmpegVersion: "7"
+    devices: ["${INTEL_RENDER_NODE}:${INTEL_RENDER_NODE}"]
+    group_add: ["987"]   # host 'render' group, for Intel QSV
+    volumes:
+      - ./config/tdarr/server:/app/server
+      - ./config/tdarr/configs:/app/configs
+      - ./config/tdarr/logs:/app/logs
+      - ${DATA_DIR}:/data   # transcode cache = /data/transcode_cache (same mount → instant replace)
+    restart: unless-stopped
+
+  # ---------------------------------------------------------------- playback
+  jellyfin:
+    image: jellyfin/jellyfin:latest
+    container_name: jellyfin
+    user: ${PUID}:${PGID}
+    group_add: ["987"]   # host 'render' group, for Intel QSV
+    networks:
+      media: {ipv4_address: 172.30.0.15}
+    ports:
+      - 8096:8096
+      - 7359:7359/udp    # lets TV apps auto-discover the server on the LAN
+    environment:
+      TZ: ${TZ}
+      JELLYFIN_PublishedServerUrl: http://10.0.0.42:8096
+    devices: ["${INTEL_RENDER_NODE}:${INTEL_RENDER_NODE}"]
+    volumes:
+      - ./config/jellyfin:/config
+      - ./cache/jellyfin:/cache
+      - ${DATA_DIR}/media:/data/media
+      - /mnt/media2:/mnt/media2:rslave
+      - /mnt/usb-library:/mnt/usb-library:rslave   # library on the 6 TB drive (writable so Jellyfin can delete)
+    restart: unless-stopped
+
+  seerr:   # successor of Jellyseerr/Overseerr
+    image: ghcr.io/seerr-team/seerr:v3
+    container_name: seerr
+    init: true
+    networks:
+      media: {ipv4_address: 172.30.0.16}
+    ports: [5055:5055]
+    environment:
+      TZ: ${TZ}
+    volumes:
+      - ./config/jellyseerr:/app/config
+    restart: unless-stopped
+
+  recyclarr:
+    image: ghcr.io/recyclarr/recyclarr:8
+    container_name: recyclarr
+    user: ${PUID}:${PGID}
+    networks: [media]
+    environment:
+      TZ: ${TZ}
+    volumes:
+      - ./config/recyclarr:/config
+    restart: unless-stopped
